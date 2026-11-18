@@ -1,9 +1,12 @@
 """Local stand-in for Hermes' OpenAI-compatible API, for previewing the demo chat without a model.
-Owner (/v1) answers from the owner home; guest (/p/<profile>/v1) answers ONLY from the public projection."""
+Owner (/v1) answers from the owner home; guest (/p/<profile>/v1) answers ONLY from the public projection.
+An owner message containing ``rm -rf`` is held for consent like a real dangerous command, so the
+approval card can be tried: the stream sends ``approval.request`` and waits for /v1/runs/<id>/approval."""
 
 import asyncio
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -17,6 +20,7 @@ OWNER_HOME = Path(os.environ["SALT_OWNER_HOME"])
 PUBLIC_HOME = Path(os.environ["SALT_PUBLIC_HOME"])
 KEYS = {"owner": os.environ["SALT_OWNER_KEY"], "guest": os.environ["SALT_PUBLIC_KEY"]}
 app = FastAPI()
+WAITING: dict[str, asyncio.Future] = {}  # run id -> the owner's answer to a held command
 
 
 def answer(role: str, q: str) -> str:
@@ -43,9 +47,24 @@ async def handle(request: Request, role: str):
         raise HTTPException(401, "bad key")
     body = await request.json()
     q = body["messages"][-1]["content"]
-    text = answer(role, q)
 
     async def gen():
+        text = answer(role, q)
+        if role == "owner" and isinstance(q, str) and "rm -rf" in q:
+            run_id = "chatcmpl-" + secrets.token_hex(8)
+            WAITING[run_id] = asyncio.get_running_loop().create_future()
+            event = {"event": "approval.request", "run_id": run_id, "request_id": secrets.token_hex(8),
+                     "execution_generation": 1, "command": "rm -rf ./demo-scratch",
+                     "description": "delete in a project path", "choices": ["once", "session", "always", "deny"]}
+            yield "event: approval.request\ndata: " + json.dumps(event) + "\n\n"
+            try:
+                choice = await asyncio.wait_for(WAITING[run_id], 120)
+            except TimeoutError:
+                choice = "timeout"
+            finally:
+                WAITING.pop(run_id, None)
+            text = ("**[演示后端]** 命令没有执行：" + ("你拒绝了。" if choice == "deny" else "等待批准超时。")
+                    if choice in ("deny", "timeout") else f"**[演示后端]** 已批准（{choice}），假装执行完了。")
         for i in range(0, len(text), 3):
             chunk = {"choices": [{"delta": {"content": text[i:i + 3]}}]}
             yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
@@ -62,3 +81,14 @@ async def owner(request: Request):
 @app.post("/p/{profile}/v1/chat/completions")
 async def guest(profile: str, request: Request):
     return await handle(request, "guest")
+
+
+@app.post("/v1/runs/{run_id}/approval")
+async def approval(run_id: str, request: Request):
+    if request.headers.get("authorization") != f"Bearer {KEYS['owner']}":
+        raise HTTPException(401, "bad key")
+    waiting = WAITING.get(run_id)
+    if waiting is None or waiting.done():
+        raise HTTPException(409, "approval_not_pending")
+    waiting.set_result(str((await request.json()).get("choice")))
+    return {"run_id": run_id, "status": "resolved"}

@@ -35,6 +35,15 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:29;opa
 .u .p{color:var(--accent);margin-right:8px;user-select:none}
 .sys{color:var(--dim);font-size:13px}
 .err{color:var(--err)}
+/* a command Hermes is holding until the owner answers */
+.ask{border:1px solid var(--warn);padding:10px 12px;font-size:13px}
+.ask .h{color:var(--warn);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;user-select:none}
+.ask pre{margin:8px 0;padding:8px 10px;background:var(--code);border:1px solid var(--hair);white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto}
+.ask .b{display:flex;flex-wrap:wrap;gap:8px}
+.ask button{font:inherit;border:1px solid var(--accent);background:transparent;color:var(--accent);border-radius:0;padding:2px 10px;cursor:pointer}
+.ask button.deny{border-color:var(--err);color:var(--err)}
+.ask button:disabled{opacity:.5;cursor:default}
+.ask .r{color:var(--dim)}
 .tool{color:var(--dim);font-size:12.5px;margin:2px 0 6px;border-left:2px solid var(--accent);padding-left:10px}
 .tool b{color:var(--accent);font-weight:600}
 .tool .ok{color:var(--ok)}
@@ -243,9 +252,20 @@ async function send(text){
       let p;while((p=buf.indexOf('\n\n'))>=0){const line=buf.slice(0,p);buf=buf.slice(p+2);
         if(!line.startsWith('data:'))continue;const d=JSON.parse(line.slice(5));
         if(d.t){e.t+=d.t;talking(true);el.innerHTML=md(e.t)+'<span class="cursor"></span>';log.scrollTop=log.scrollHeight;}
+        if(d.approval)askApproval(d.approval,el);
         if(d.error)throw new Error(d.error);}}
   }catch(err){if(err.name==='AbortError')e.t+=(e.t?'\n\n':'')+'^C stopped';else{e.t+=(e.t?'\n\n':'')+'⚠ '+err.message;if(err instanceof TypeError)online(false);}}
-  finally{busy=null;delete e.live;el.innerHTML=md(e.t);transcript.push({k:'a',t:e.t});save();talking(false);if(role!=='owner'&&SEAL_RE.test(e.t))sealed();}}
+  finally{closeAsks();busy=null;delete e.live;el.innerHTML=md(e.t);transcript.push({k:'a',t:e.t});save();talking(false);if(role!=='owner'&&SEAL_RE.test(e.t))sealed();}}
+const ASK={once:'Run once',session:'Allow this session',always:'Always allow',deny:'Deny'};
+function settleAsk(d,t){const b=d.querySelector('.b');if(b)b.outerHTML=`<div class="r">${esc(t)}</div>`;}
+function closeAsks(){log.querySelectorAll('.ask .b').forEach(b=>settleAsk(b.parentNode,'No longer waiting.'));}
+function askApproval(a,before){const d=document.createElement('div');d.className='msg ask';
+  d.innerHTML=`<div class="h">Approval needed</div>${a.description?`<div>${esc(a.description)}</div>`:''}<pre>${esc(a.command||'(no command text)')}</pre><div class="b">${a.choices.map(c=>`<button class="${c==='deny'?'deny':''}" data-c="${esc(c)}">${ASK[c]||esc(c)}</button>`).join('')}</div>`;
+  log.insertBefore(d,before);log.scrollTop=log.scrollHeight;
+  d.querySelector('.b').addEventListener('click',async ev=>{const b=ev.target.closest('button');if(!b||b.disabled)return;
+    const all=[...d.querySelectorAll('button')],c=b.dataset.c;all.forEach(x=>x.disabled=true);
+    try{await api('/api/approve',{run_id:a.run_id,request_id:a.request_id,choice:c});settleAsk(d,c==='deny'?'Denied.':'Approved: '+(ASK[c]||c).toLowerCase()+'.');}
+    catch(err){if(/no longer waiting/.test(err.message))settleAsk(d,'No longer waiting.');else{all.forEach(x=>x.disabled=false);sys('Approval failed: '+err.message,'err');}}});}
 async function command(c){const [name,...rest]=c.trim().split(/\s+/);const arg=rest.join(' ');
   if(name==='/help'){sys(CMDS.map(([a,b])=>a.padEnd(10)+b).join('\n'));}
   else if(name==='/clear'){log.innerHTML='';}

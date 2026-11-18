@@ -1,4 +1,7 @@
 
+import json
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -463,3 +466,130 @@ def test_opening_the_shelf_sends_nothing_to_the_model(client, monkeypatch):
     assert sent == [] and opened["model"] is False and opened["items"]
     client.post("/api/board/classify", json={})
     assert sent
+
+
+APPROVAL = {"event": "approval.request", "run_id": "chatcmpl-1", "request_id": "r1", "execution_generation": 3,
+            "command": "rm -rf /srv/x", "description": "delete in root path",
+            "choices": ["once", "session", "always", "deny"]}
+
+
+def _hermes_with_held_command(monkeypatch, posts, during=None, status=200):
+    """A Hermes stream that reports tool progress, holds one command for consent, then answers.
+    *during* runs while the stream is still open, the way the owner clicks a button mid-turn."""
+
+    class FakeResponse:
+        status_code = status
+
+    class FakeStream:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aiter_lines(self):
+            yield "event: hermes.tool.progress"
+            yield 'data: {"tool": "terminal", "status": "running", "choices": "not an answer"}'
+            yield ""
+            yield "event: approval.request"
+            yield "data: " + json.dumps(APPROVAL)
+            yield ""
+            if during:
+                await during()
+            yield 'data: {"choices":[{"delta":{"content":"done"}}]}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            return FakeStream()
+
+        async def post(self, url, json=None, headers=None):
+            posts.append((url, json, headers))
+            return FakeResponse()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+
+def _events(text):
+    return [json.loads(line[5:]) for line in text.splitlines() if line.startswith("data:")]
+
+
+def test_held_command_is_refused_for_everyone_but_the_owner(client, tmp_path, monkeypatch):
+    posts = []
+    _hermes_with_held_command(monkeypatch, posts)
+    r = client.post("/api/chat", json={"message": "hello"})
+    # tool progress and the approval request never reach a guest, and neither is read as answer text
+    assert _events(r.text) == [{"t": "done"}, {"done": True}]
+    (url, body, headers), = posts
+    assert url.endswith("/p/public/v1/runs/chatcmpl-1/approval") and headers["Authorization"] == "Bearer pk"
+    assert body == {"choice": "deny", "request_id": "r1", "execution_generation": 3}
+    assert client.post("/api/approve", json={"run_id": "chatcmpl-1", "request_id": "r1",
+                                             "choice": "once"}).status_code == 403
+    viewer = TestClient(_viewer_app(tmp_path))
+    viewer.post("/api/unlock", json={"passphrase": VIEW})
+    assert _events(viewer.post("/api/chat", json={"message": "hi"}).text) == [{"t": "done"}, {"done": True}]
+    assert posts[-1][1]["choice"] == "deny" and "/p/" not in posts[-1][0]
+    assert viewer.post("/api/approve", json={"run_id": "chatcmpl-1", "request_id": "r1",
+                                             "choice": "once"}).status_code == 403
+
+
+def test_owner_answers_a_held_command_while_the_turn_is_open(client, monkeypatch):
+    real_client, posts, answers = httpx.AsyncClient, [], {}
+    client.post("/api/unlock", json={"passphrase": PASS})
+    _hermes_with_held_command(monkeypatch, posts)
+    first = _events(client.post("/api/chat", json={"message": "hello"}).text)  # fixes owner_sid in the cookie
+    assert first[0] == {"approval": {"run_id": "chatcmpl-1", "request_id": "r1", "command": "rm -rf /srv/x",
+                                     "description": "delete in root path",
+                                     "choices": ["once", "session", "always", "deny"]}}
+    assert first[1:] == [{"t": "done"}, {"done": True}] and posts == []  # the owner is asked, never auto-refused
+    # once the turn is over there is nothing left to answer
+    ask = {"run_id": "chatcmpl-1", "request_id": "r1"}
+    assert client.post("/api/approve", json={**ask, "choice": "once"}).status_code == 404
+
+    async def click():
+        cookies = {"salt": client.cookies.get("salt")}
+        transport = httpx.ASGITransport(app=client.app)
+        async with real_client(transport=transport, base_url="http://testserver", cookies=cookies) as browser:
+            answers["bad"] = (await browser.post("/api/approve", json={**ask, "choice": "sudo"})).status_code
+            answers["other run"] = (await browser.post(
+                "/api/approve", json={"run_id": "chatcmpl-2", "request_id": "r1", "choice": "once"})).status_code
+            async with real_client(transport=transport, base_url="http://testserver") as stranger:
+                answers["guest"] = (await stranger.post("/api/approve", json={**ask, "choice": "once"})).status_code
+            answers["ok"] = (await browser.post("/api/approve", json={**ask, "choice": "session"})).json()
+            answers["twice"] = (await browser.post("/api/approve", json={**ask, "choice": "session"})).status_code
+
+    _hermes_with_held_command(monkeypatch, posts, during=click)
+    client.post("/api/chat", json={"message": "hello"})
+    assert answers == {"bad": 400, "other run": 404, "guest": 403, "ok": {"ok": True, "choice": "session"}, "twice": 404}
+    (url, body, headers), = posts
+    assert url.endswith("/v1/runs/chatcmpl-1/approval") and "/p/" not in url
+    assert body == {"choice": "session", "request_id": "r1", "execution_generation": 3}
+    assert headers["Authorization"] == "Bearer ok" and headers["X-Hermes-Session-Id"].startswith("salt-o-")
+
+
+def test_an_approval_hermes_no_longer_waits_for_is_reported_as_gone(client, monkeypatch):
+    real_client, posts, answers = httpx.AsyncClient, [], {}
+    client.post("/api/unlock", json={"passphrase": PASS})
+    _hermes_with_held_command(monkeypatch, posts)
+    client.post("/api/chat", json={"message": "hello"})
+
+    async def click():
+        async with real_client(transport=httpx.ASGITransport(app=client.app), base_url="http://testserver",
+                               cookies={"salt": client.cookies.get("salt")}) as browser:
+            r = await browser.post("/api/approve", json={"run_id": "chatcmpl-1", "request_id": "r1", "choice": "once"})
+            answers["status"], answers["detail"] = r.status_code, r.json()["detail"]
+
+    _hermes_with_held_command(monkeypatch, posts, during=click, status=409)
+    client.post("/api/chat", json={"message": "hello"})
+    assert answers == {"status": 409, "detail": "that command is no longer waiting for approval"}

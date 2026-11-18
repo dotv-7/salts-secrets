@@ -52,6 +52,9 @@ DEFAULT_POLICY = """# What may be shared about Salt (read by the drafter, edited
 - Unpublished thresholds or anything she marks as private / do not publish
 """
 COOKIE = "salt"
+# answers Hermes accepts for a command it is holding for consent, and how much of the command the page shows
+APPROVAL_CHOICES = ("once", "session", "always", "deny")
+APPROVAL_COMMAND_CHARS, APPROVAL_DESCRIPTION_CHARS = 4000, 500
 OWNER_TTL = 12 * 3600
 VIEWER_PREFIX = "salt-v-"  # salts_secrets.readonly blocks every tool in owner sessions with this prefix
 VIEWER_TURNS = 12  # then a fresh session, so compression never rotates a read-only session into a new id
@@ -332,6 +335,70 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         window.append(now)
         return lambda: now in window and window.remove(now)
 
+    # Hermes run id -> a command it is holding for consent: where the answer goes and whose chat it belongs to.
+    # An entry lives exactly as long as the chat stream that received the request.
+    approvals: dict[str, dict] = {}
+
+    def hold_approval(event: dict, api_base: str, headers: dict, sid: str) -> Optional[dict]:
+        """Remember one ``approval.request`` from Hermes; returns what the chat page needs to ask about it."""
+        run_id = str(event.get("run_id") or "")
+        if not run_id:
+            return None
+        request_id = event.get("request_id") if isinstance(event.get("request_id"), str) else ""
+        offered = event.get("choices") if isinstance(event.get("choices"), list) else []
+        choices = [c for c in APPROVAL_CHOICES if c in offered] or ["once", "deny"]
+        entry = approvals.setdefault(run_id, {"url": f"{api_base}/runs/{run_id}/approval", "headers": headers,
+                                              "sid": sid, "pending": {}})
+        generation = event.get("execution_generation")
+        entry["pending"][request_id] = {"choices": choices,
+                                        "generation": generation if type(generation) is int else None}
+        return {"run_id": run_id, "request_id": request_id, "choices": choices,
+                "command": str(event.get("command") or "")[:APPROVAL_COMMAND_CHARS],
+                "description": str(event.get("description") or "")[:APPROVAL_DESCRIPTION_CHARS]}
+
+    async def answer_approval(client, run_id: str, request_id: str, choice: str) -> int:
+        """Send one answer to Hermes -> its HTTP status (200 answered, 409 it no longer waits; 404 unknown here)."""
+        entry = approvals.get(run_id)
+        held = entry["pending"].get(request_id) if entry else None
+        if held is None:
+            return 404
+        body = {"choice": choice}
+        if request_id:
+            body["request_id"] = request_id
+        if held["generation"] is not None:
+            body["execution_generation"] = held["generation"]
+        r = await client.post(entry["url"], json=body, headers=entry["headers"])
+        if r.status_code in (200, 409):
+            entry["pending"].pop(request_id, None)
+        return r.status_code
+
+    @app.post("/api/approve")
+    async def approve(request: Request):
+        """The signed-in owner answers a command Hermes is holding: run it once, allow it, or deny it."""
+        require_json(request)
+        st = state(request)
+        if not is_owner(st):
+            raise HTTPException(403, "only the signed-in owner can approve commands")
+        body = await request.json()
+        run_id, request_id = str(body.get("run_id") or ""), str(body.get("request_id") or "")
+        choice = str(body.get("choice") or "").strip().lower()
+        entry = approvals.get(run_id)
+        held = entry["pending"].get(request_id) if entry and entry["sid"] == st.get("owner_sid") else None
+        if held is None:
+            raise HTTPException(404, "that command is no longer waiting for approval")
+        if choice not in held["choices"]:
+            raise HTTPException(400, "choice must be one of: " + ", ".join(held["choices"]))
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10)) as client:
+                status = await answer_approval(client, run_id, request_id, choice)
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"cannot reach Hermes: {type(exc).__name__}")
+        if status in (404, 409):
+            raise HTTPException(409, "that command is no longer waiting for approval")
+        if status != 200:
+            raise HTTPException(502, f"Hermes answered {status} to the approval")
+        return respond(request, st, {"ok": True, "choice": choice})
+
     @app.post("/api/chat")
     async def chat(request: Request):
         require_json(request)
@@ -369,6 +436,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         payload = {"model": "hermes-agent", "stream": True, "messages": [{"role": "user", "content": message}],
                    **override}
         headers = {"Authorization": f"Bearer {key}", "X-Hermes-Session-Id": st[sid_key]}
+        api_base, sid = url[:-len("/chat/completions")], st[sid_key]
+        may_approve = tier == "owner" and not readonly  # everyone else is refused on the spot
+        held: set[str] = set()
 
         async def stream():
             try:
@@ -379,8 +449,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                             refund()
                             yield _sse({"error": f"Hermes {r.status_code}: {detail}"})
                             return
+                        event = ""  # name of the SSE event the next data line belongs to; "" = an answer chunk
                         async for line in r.aiter_lines():
+                            if line.startswith("event:"):
+                                event = line[6:].strip()
+                                continue
                             if not line.startswith("data:"):
+                                if not line.strip():
+                                    event = ""  # a blank line ends the event
                                 continue
                             data = line[5:].strip()
                             if data == "[DONE]":
@@ -389,7 +465,28 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                                 chunk = json.loads(data)
                             except ValueError:
                                 continue
+                            if not isinstance(chunk, dict):
+                                continue
+                            if event == "approval.request":
+                                # Hermes holds a command until someone consents; its payload also has a
+                                # "choices" key (a list of strings), so it must never be read as answer text.
+                                ask = hold_approval(chunk, api_base, headers, sid)
+                                if ask is None:
+                                    continue
+                                held.add(ask["run_id"])
+                                if may_approve:
+                                    yield _sse({"approval": ask})
+                                else:
+                                    try:  # nobody in this chat may consent: refuse now, don't idle until it times out
+                                        await answer_approval(client, ask["run_id"], ask["request_id"], "deny")
+                                    except httpx.HTTPError:
+                                        pass
+                                continue
+                            if event:
+                                continue  # hermes.tool.progress, hermes.status: not answer text
                             for choice in chunk.get("choices") or []:
+                                if not isinstance(choice, dict):
+                                    continue
                                 text = (choice.get("delta") or {}).get("content")
                                 if text:
                                     yield _sse({"t": text})
@@ -397,6 +494,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             except httpx.HTTPError as exc:
                 refund()
                 yield _sse({"error": f"cannot reach Hermes: {type(exc).__name__}"})
+            finally:
+                for run_id in held:
+                    approvals.pop(run_id, None)
 
         resp = StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
